@@ -8,7 +8,7 @@ import time
 
 
 
-library_names = ['langchain', 'langchain-openai', 'faiss-cpu', 'PyPDF2','python-docx', 'openai', 'tiktoken', 'python-pptx', 'textwrap', ]
+library_names = ['spacy','pytesseract', 'sentence-transformers', 'langchain', 'langchain-openai', 'faiss-cpu', 'PyPDF2','python-docx', 'openai', 'tiktoken', 'python-pptx', 'textwrap', ]
 
 # Dynamically importing libraries
 for name in library_names:
@@ -18,7 +18,8 @@ for name in library_names:
         print(f"{name} not found. Installing {name}...")
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', name])
 
-
+from pytesseract import image_to_string
+from PIL import Image
 from PyPDF2 import PdfReader 
 import textwrap
 import docx
@@ -28,6 +29,36 @@ from langchain.text_splitter import CharacterTextSplitter
 from langchain.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
 from getpass import getpass
+import io
+
+
+import spacy
+from spacy.matcher import Matcher
+
+# Downloading the English language model for spaCy
+try:
+    nlp = spacy.load("en_core_web_sm")
+except IOError:
+    print("en_core_web_sm not found. Downloading en_core_web_sm...")
+    subprocess.check_call([sys.executable, '-m', 'spacy', 'download', 'en_core_web_sm'])
+    nlp = spacy.load("en_core_web_sm")
+
+matcher = Matcher(nlp.vocab)
+
+# Add match pattern for URLs
+pattern = [{"LIKE_URL": True}]
+matcher.add("URL_PATTERN", [pattern])
+
+def extract_keywords(text):
+    doc = nlp(text)
+    keywords = set()
+    # Add entities and noun chunks as keywords
+    for chunk in doc.noun_chunks:
+        keywords.add(chunk.root.text.lower())
+    for ent in doc.ents:
+        keywords.add(ent.text.lower())
+    return list(keywords)
+
 
 
 
@@ -63,34 +94,52 @@ def extract_texts(root_files):
     for root_file in root_files:
         _, ext = os.path.splitext(root_file)
         if ext == '.pdf':
+            # First try to extract text normally
             with open(root_file, 'rb') as f:
                 reader = PdfReader(f)
-                for i in range(len(reader.pages)):
-                    page = reader.pages[i]
-                    raw_text += page.extract_text()
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        raw_text += text + '\n'
+                    else:
+                        # If normal text extraction doesn't work, use OCR
+                        images = convert_from_path(root_file)
+                        for image in images:
+                            raw_text += image_to_string(image) + '\n'
         elif ext == '.docx':
             doc = docx.Document(root_file)
             for paragraph in doc.paragraphs:
-                raw_text += paragraph.text
+                raw_text += paragraph.text + '\n'
+            for rel in doc.part.rels.values():
+                if 'image' in rel.reltype:
+                    image_stream = io.BytesIO(rel.target_part.blob)
+                    image = Image.open(image_stream)
+                    raw_text += image_to_string(image) + '\n'
         elif ext == '.pptx':
             ppt = pptx.Presentation(root_file)
             for slide in ppt.slides:
                 for shape in slide.shapes:
                     if hasattr(shape, 'text'):
-                        raw_text += shape.text
+                        raw_text += shape.text + '\n'
+                    elif shape.shape_type == 13: # ShapeType 13 corresponds to a picture
+                        image_stream = io.BytesIO(shape.image.blob)
+                        image = Image.open(image_stream)
+                        raw_text += image_to_string(image) + '\n'
 
-    # retreival we don't hit the token size limits. 
-    text_splitter = CharacterTextSplitter(        
-                                            separator = "\n",
-                                            chunk_size = 1000,
-                                            chunk_overlap  = 200,
-                                            length_function = len,
-                                        )
+    text_splitter = CharacterTextSplitter(
+        separator="\n",
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len,
+    )
 
     texts = text_splitter.split_text(raw_text)
-
     docsearch = FAISS.from_texts(texts, embeddings)
-    return docsearch
+
+    # Return both the FAISS index and the texts
+    return docsearch, texts
+
+
 
 
 def run_query(query, docsearch):
@@ -128,37 +177,104 @@ def upload_file(folder_path):
 
 
     return root_file
+################
+import spacy
+import torch
+from sentence_transformers import SentenceTransformer, util
 
+
+
+nlp = spacy.load("en_core_web_sm")  # Load a language model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+
+
+
+
+##############
+
+
+def find_similar_questions(query, questions, top_k=5):
+    query_embedding = model.encode(query, convert_to_tensor=True)
+    question_embeddings = model.encode(questions, convert_to_tensor=True)
+    cos_scores = util.pytorch_cos_sim(query_embedding, question_embeddings)[0]
+
+    top_results = torch.topk(cos_scores, k=top_k*2)  # Fetch more results initially
+    suggested_questions = []
+    seen_keywords = set()
+
+    for index in top_results.indices:
+        question = questions[index]
+        keyword = question.split()[2]  
+
+        if keyword not in seen_keywords:
+            suggested_questions.append(question)
+            seen_keywords.add(keyword)
+            if len(suggested_questions) == top_k:
+                break
+
+    return suggested_questions
+
+def load_all_questions(all_texts):
+    unique_keywords = set()
+    for text in all_texts:
+        keywords = extract_keywords(text)
+        unique_keywords.update(keywords)
+    
+    questions = []
+    for keyword in unique_keywords:
+        temp_questions = [
+            f"What is {keyword}?",
+            f"How does {keyword} work?",
+            f"What are the applications of {keyword}?",
+            f"Explain the concept of {keyword}",
+            f"Advantages and disadvantages of {keyword}?"
+        ]
+        questions.extend(temp_questions)
+        #print(f"Questions for '{keyword}': {temp_questions}")
+    return questions
+
+
+
+#################
 
 def run_conversation(folder_path):
-    """
-    Starts a dialogue with the user by continuously requesting input queries and processing them against a PDF file.
-    Parameters:
-    folder_path: A string that specifies the location of the folder containing the PDF file.
-    Returns:
-    Conducts a conversation based on the PDF file.
-    """
     root_files = upload_file(folder_path)
-    # location of the pdf
-
-
-    docsearch = extract_texts(root_files)
-
+    docsearch, all_texts = extract_texts(root_files)  # Receive texts as well
+    all_questions = load_all_questions(all_texts)
     count = 0
     while True:
-        print("Question ", count + 1)
-
-        query = input(" Ask questions or type stop:\n ")
-        
-        if query.lower() == "stop":
+        print(f"Question {count + 1}")
+        user_input = input("Please Ask questions, or type 'suggest' to get related questions, or type 'stop' when done:\n")
+        if user_input.lower() == "stop":
             print("Thanks.")
             break
-        elif query == "":
-            print("Input is empty!")
-            continue
+        elif user_input.lower() == "suggest":
+            # Generate and print related questions suggestions
+            if count == 0:
+                print("Please ask a question first before suggesting related topics.")
+            else:
+                suggestions = find_similar_questions(last_query, all_questions)
+                print("Related questions:")
+                for question in suggestions:
+                    print(question)
+        elif user_input.strip() == "":
+            print("Input is empty, please enter a valid command.")
         else:
-            wrapped_text = textwrap.wrap(run_query(query, docsearch), width=100)
+            # Extract keywords from the user's query
+            keywords = extract_keywords(user_input)
+            
+            # Run the query against the documents
+            response = run_query(user_input, docsearch)
+            
+            # Print the response
+            wrapped_text = textwrap.wrap(response, width=100)
             print("Answer:")
             for line in wrapped_text:
                 print(line)
+            
+            # Save the last valid question for the suggest feature
+            last_query = user_input
+            
             count += 1
